@@ -396,6 +396,49 @@ pub struct X11rbClient<C: HasConnection> {
 }
 
 #[cfg(feature = "x11rb-client")]
+impl<C: HasConnection> Drop for X11rbClient<C> {
+    fn drop(&mut self) {
+        let _ = self.conn().destroy_window(self.client_window);
+        let _ = self.conn().flush();
+    }
+}
+
+#[cfg(all(test, feature = "x11rb-client"))]
+mod client_window_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "Requires a private X11 display"]
+    fn unavailable_server_does_not_allocate_windows() {
+        let (conn, screen) = RustConnection::connect(None).unwrap();
+        let conn = Rc::new(conn);
+        let root = conn.setup().roots[screen].root;
+        let before = conn.query_tree(root).unwrap().reply().unwrap().children;
+        for _ in 0..20 {
+            assert!(
+                X11rbClient::init(conn.clone(), screen, Some("jian-test-missing-server")).is_err()
+            );
+        }
+        assert_eq!(
+            conn.query_tree(root).unwrap().reply().unwrap().children,
+            before
+        );
+    }
+
+    #[test]
+    #[ignore = "Requires a private X11 display with an XIM server"]
+    fn dropping_client_releases_its_window() {
+        let (conn, screen) = RustConnection::connect(None).unwrap();
+        let conn = Rc::new(conn);
+        let client = X11rbClient::init(conn.clone(), screen, None).unwrap();
+        let window = client.client_window;
+        conn.get_window_attributes(window).unwrap().reply().unwrap();
+        drop(client);
+        assert!(conn.get_window_attributes(window).unwrap().reply().is_err());
+    }
+}
+
+#[cfg(feature = "x11rb-client")]
 impl<C: HasConnection> X11rbClient<C> {
     pub fn init(
         has_conn: C,
@@ -405,20 +448,6 @@ impl<C: HasConnection> X11rbClient<C> {
         let conn = has_conn.conn();
         let screen = &conn.setup().roots[screen_num];
         let client_window = conn.generate_id()?;
-
-        conn.create_window(
-            COPY_DEPTH_FROM_PARENT,
-            client_window,
-            screen.root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            WindowClass::INPUT_ONLY,
-            screen.root_visual,
-            &Default::default(),
-        )?;
 
         let var = std::env::var("XMODIFIERS").ok();
         let var = var.as_ref().and_then(|n| n.strip_prefix("@im="));
@@ -453,18 +482,22 @@ impl<C: HasConnection> X11rbClient<C> {
                 };
 
                 if let Some(name) = name.strip_prefix("@server=") {
-                    if name == im_name {
-                        conn.convert_selection(
+                    if name == im_name && server_owner != x11rb::NONE {
+                        conn.create_window(
+                            COPY_DEPTH_FROM_PARENT,
                             client_window,
-                            server_atom,
-                            atoms.TRANSPORT,
-                            atoms.TRANSPORT,
-                            CURRENT_TIME,
-                        )?;
-
-                        conn.flush()?;
-
-                        return Ok(Self {
+                            screen.root,
+                            0,
+                            0,
+                            1,
+                            1,
+                            0,
+                            WindowClass::INPUT_ONLY,
+                            screen.root_visual,
+                            &Default::default(),
+                        )?
+                        .check()?;
+                        let client = Self {
                             has_conn,
                             atoms,
                             server_atom,
@@ -476,7 +509,16 @@ impl<C: HasConnection> X11rbClient<C> {
                             client_window,
                             sequence: 0,
                             buf: Vec::with_capacity(1024),
-                        });
+                        };
+                        client.conn().convert_selection(
+                            client_window,
+                            server_atom,
+                            client.atoms.TRANSPORT,
+                            client.atoms.TRANSPORT,
+                            CURRENT_TIME,
+                        )?;
+                        client.conn().flush()?;
+                        return Ok(client);
                     }
                 }
             }
